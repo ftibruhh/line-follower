@@ -1,0 +1,305 @@
+#define MOTOR_SPEED 180
+#define DEBOUNCE_DELAY 50  // in milliseconds
+
+// IR Sensors
+#define IR_SENSOR_RIGHTMOST A0    // Sensor 1
+#define IR_SENSOR_RIGHTMIDDLE A1   // Sensor 2
+#define IR_SENSOR_LEFTMIDDLE A2    // Sensor 3
+#define IR_SENSOR_LEFTMOST  A3    // Sensor 4
+
+// Motor Driver Pins
+const int enableRightMotor = 6;
+const int rightMotorPin1 = 7;
+const int rightMotorPin2 = 8;
+
+const int enableLeftMotor = 5;
+const int leftMotorPin1 = 9;
+const int leftMotorPin2 = 10;
+
+// Variables for debouncing and calibration
+unsigned long lastDebounceTime[4] = {0, 0, 0, 0};
+bool lastSensorState[4] = {LOW, LOW, LOW, LOW};
+bool sensorValues[4] = {LOW, LOW, LOW, LOW};
+
+// Calibration Variables
+int baselineLine[4] = {0, 0, 0, 0};
+int baselineBackground[4] = {0, 0, 0, 0};
+bool calibrated = false;
+
+// Mode Detection
+bool isInverted = false;
+
+// Thresholds
+int thresholdLine = 0;
+
+// Line Loss Handling
+const int LINE_LOSS_TIMEOUT = 200; // milliseconds
+unsigned long lineLostTime = 0;
+bool lineLost = false;
+
+// Proportional Control Variables
+const float Kp = 1.0; // Proportional gain
+float previousError = 0;
+float integral = 0;
+
+void setup() {
+  // Set PWM frequency to 7812.5 Hz for pins D5 and D6
+  // Timer0 controls pins 5 and 6 on Arduino Uno
+  TCCR0B = (TCCR0B & 0b11111000) | 0x02;
+
+  // Initialize motor control pins
+  pinMode(enableRightMotor, OUTPUT);
+  pinMode(rightMotorPin1, OUTPUT);
+  pinMode(rightMotorPin2, OUTPUT);
+
+  pinMode(enableLeftMotor, OUTPUT);
+  pinMode(leftMotorPin1, OUTPUT);
+  pinMode(leftMotorPin2, OUTPUT);
+
+  // Initialize IR sensor pins
+  pinMode(IR_SENSOR_RIGHTMOST, INPUT);
+  pinMode(IR_SENSOR_RIGHTMIDDLE, INPUT);
+  pinMode(IR_SENSOR_LEFTMIDDLE, INPUT);
+  pinMode(IR_SENSOR_LEFTMOST, INPUT);
+
+  // Initialize Serial Monitor for debugging
+  Serial.begin(9600);
+  delay(1000); // Allow Serial Monitor to initialize
+
+  // Calibrate sensors
+  calibrateSensors();
+
+  // Initialize motors to stop
+  rotateMotor(0, 0);
+}
+
+void loop() {
+  if (!calibrated) {
+    calibrateSensors();
+    return;
+  }
+
+  // Read and debounce all IR sensors
+  for (int i = 0; i < 4; i++) {
+    sensorValues[i] = readSensor(i);
+  }
+
+  // Debugging information
+  Serial.print("Sensors: ");
+  for (int i = 0; i < 4; i++) {
+    Serial.print(sensorValues[i]);
+    Serial.print(" ");
+  }
+  Serial.print(" | Inverted Mode: ");
+  Serial.println(isInverted ? "Yes" : "No");
+
+  // Check if all sensors are off the line
+  bool allOff = true;
+  for (int i = 0; i < 4; i++) {
+    if (sensorValues[i] == HIGH) { // Line detected
+      allOff = false;
+      break;
+    }
+  }
+
+  if (allOff) {
+    if (!lineLost) {
+      lineLost = true;
+      lineLostTime = millis();
+      Serial.println("Line lost. Starting timeout.");
+    }
+    else {
+      if (millis() - lineLostTime > LINE_LOSS_TIMEOUT) {
+        // Stop the robot if line is lost for too long
+        rotateMotor(0, 0);
+        Serial.println("Line lost for too long. Stopping.");
+        // Optionally, implement searching behavior here
+      }
+    }
+  }
+  else {
+    if (lineLost) {
+      lineLost = false;
+      Serial.println("Line regained.");
+      // Reset PID variables if needed
+      previousError = 0;
+      integral = 0;
+    }
+
+    // Decision making based on sensor readings
+    float error = calculateError();
+
+    // Proportional Control
+    float output = Kp * error;
+
+    // Calculate motor speeds
+    int leftSpeed = MOTOR_SPEED + output;
+    int rightSpeed = MOTOR_SPEED - output;
+
+    // Constrain speeds to valid PWM range
+    leftSpeed = constrain(leftSpeed, -255, 255);
+    rightSpeed = constrain(rightSpeed, -255, 255);
+
+    rotateMotor(rightSpeed, leftSpeed);
+
+    // Debugging
+    Serial.print("Error: ");
+    Serial.print(error);
+    Serial.print(" | Output: ");
+    Serial.print(output);
+    Serial.print(" | Left Speed: ");
+    Serial.print(leftSpeed);
+    Serial.print(" | Right Speed: ");
+    Serial.println(rightSpeed);
+  }
+
+  delay(10);  // Small delay for stability
+}
+
+// Function to perform sensor calibration
+void calibrateSensors() {
+  Serial.println("Starting Calibration...");
+
+  // Calibrate on Line
+  Serial.println("Place the robot on the line.");
+  delay(3000); // Wait for 3 seconds
+  for (int i = 0; i < 4; i++) {
+    baselineLine[i] = analogRead(getSensorPin(i));
+    Serial.print("Sensor ");
+    Serial.print(i+1);
+    Serial.print(" Line Value: ");
+    Serial.println(baselineLine[i]);
+  }
+
+  // Calibrate on Background
+  Serial.println("Move the robot to the background.");
+  delay(3000); // Wait for 3 seconds
+  for (int i = 0; i < 4; i++) {
+    baselineBackground[i] = analogRead(getSensorPin(i));
+    Serial.print("Sensor ");
+    Serial.print(i+1);
+    Serial.print(" Background Value: ");
+    Serial.println(baselineBackground[i]);
+  }
+
+  // Determine if line is darker or lighter than background
+  // Assuming higher analog value means lighter
+  // Check majority of sensors
+  int darkLineCount = 0;
+  int lightLineCount = 0;
+  for (int i = 0; i < 4; i++) {
+    if (baselineLine[i] < baselineBackground[i]) {
+      darkLineCount++;
+    } else {
+      lightLineCount++;
+    }
+  }
+
+  if (darkLineCount > lightLineCount) {
+    isInverted = false; // Line is darker
+    Serial.println("Mode: Dark Line on Light Background");
+  } else {
+    isInverted = true;  // Line is lighter
+    Serial.println("Mode: Light Line on Dark Background");
+  }
+
+  // Set thresholds as midpoints
+  // For simplicity, using average of all thresholds
+  int sumThresholds = 0;
+  for (int i = 0; i < 4; i++) {
+    if (!isInverted) {
+      sumThresholds += (baselineLine[i] + baselineBackground[i]) / 2;
+    } else {
+      sumThresholds += (baselineBackground[i] + baselineLine[i]) / 2;
+    }
+  }
+  thresholdLine = sumThresholds / 4;
+  Serial.print("Global Threshold Line Value: ");
+  Serial.println(thresholdLine);
+
+  calibrated = true;
+  Serial.println("Calibration Complete.");
+}
+
+// Function to read a sensor and determine if it detects the line
+bool readSensor(int index) {
+  int sensorValue = analogRead(getSensorPin(index));
+  
+  // Determine if sensor detects the line based on mode
+  if (!isInverted) {
+    // Dark line on light background
+    return sensorValue < thresholdLine;
+  }
+  else {
+    // Light line on dark background
+    return sensorValue > thresholdLine;
+  }
+}
+
+// Function to calculate error based on sensor readings
+float calculateError() {
+  // Assign weights to sensors
+  // Example weights: Sensor 4 (-3), Sensor 3 (-1), Sensor 2 (+1), Sensor 1 (+3)
+  int weights[4] = {-3, -1, 1, 3};
+  int sum = 0;
+  int count = 0;
+
+  for (int i = 0; i < 4; i++) {
+    if (sensorValues[i] == HIGH) { // Line detected
+      sum += weights[i];
+      count++;
+    }
+  }
+
+  if (count == 0) {
+    return 0; // No error if no line detected
+  }
+
+  return (float)sum / count; // Average error
+}
+
+// Function to rotate motors based on speed inputs
+void rotateMotor(int rightMotorSpeed, int leftMotorSpeed) {
+  // Control Right Motor Direction
+  if (rightMotorSpeed < 0) {
+    digitalWrite(rightMotorPin1, LOW);
+    digitalWrite(rightMotorPin2, HIGH);
+  }
+  else if (rightMotorSpeed > 0) {
+    digitalWrite(rightMotorPin1, HIGH);
+    digitalWrite(rightMotorPin2, LOW);
+  }
+  else {
+    digitalWrite(rightMotorPin1, LOW);
+    digitalWrite(rightMotorPin2, LOW);
+  }
+
+  // Control Left Motor Direction
+  if (leftMotorSpeed < 0) {
+    digitalWrite(leftMotorPin1, LOW);
+    digitalWrite(leftMotorPin2, HIGH);
+  }
+  else if (leftMotorSpeed > 0) {
+    digitalWrite(leftMotorPin1, HIGH);
+    digitalWrite(leftMotorPin2, LOW);
+  }
+  else {
+    digitalWrite(leftMotorPin1, LOW);
+    digitalWrite(leftMotorPin2, LOW);
+  }
+
+  // Set Motor Speeds using PWM
+  analogWrite(enableRightMotor, constrain(abs(rightMotorSpeed), 0, 255));
+  analogWrite(enableLeftMotor, constrain(abs(leftMotorSpeed), 0, 255));
+}
+
+// Function to get sensor pin based on index
+int getSensorPin(int index) {
+  switch(index) {
+    case 0: return IR_SENSOR_RIGHTMOST;
+    case 1: return IR_SENSOR_RIGHTMIDDLE;
+    case 2: return IR_SENSOR_LEFTMIDDLE;
+    case 3: return IR_SENSOR_LEFTMOST;
+    default: return IR_SENSOR_RIGHTMOST;
+  }
+}
